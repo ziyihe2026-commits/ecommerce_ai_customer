@@ -13,6 +13,7 @@
 from dotenv import load_dotenv
 import os
 import sqlite3
+from datetime import datetime
 from typing import Optional
 
 # ── LangChain / LangGraph ──────────────────────────────
@@ -288,7 +289,108 @@ def chat(user_input: str, thread_id: str = "default") -> str:
 
 
 # ================================================================
-# 7. 命令行入口
+# 7. 增强版客服 Agent 封装 —— 情绪优先 + 智能转人工
+# ================================================================
+class EnhancedCustomerServiceAgent:
+    """
+    增强版客服 Agent，在基础 Agent 之上增加：
+
+    【新增能力】
+    1. 情绪预检 —— 先于 Agent 检测用户情绪，负面情绪立即安抚
+    2. 智能转人工 —— Agent 回复中包含转人工意图时自动走排队流程
+    3. 人工客服排队 —— 维护转人工队列，支持排队序号查询
+    4. 异常兜底 —— Agent 出错时自动转人工，避免用户等待超时
+    """
+
+    def __init__(self):
+        self.human_agent_queue: list[dict] = []
+
+    def handle_message(self, user_input: str, thread_id: str = "default") -> str:
+        """
+        增强版消息处理入口。
+
+        工作流程：
+        ① 情绪预检（detect_emotion）
+        ② 负面/紧急情绪 → 安抚话术
+        ③ 调用基础 Agent 处理
+        ④ 判断是否需要转人工
+        ⑤ 返回最终结果
+
+        Parameters
+        ----------
+        user_input : 用户输入
+        thread_id  : 会话 ID，用于多轮对话记忆隔离
+
+        Returns
+        -------
+        str : 客服回复
+        """
+        # ── ① 情绪预检 ──
+        try:
+            emotion_result = detect_emotion.invoke({"user_message": user_input})
+        except Exception:
+            emotion_result = "情绪等级：正常。标准服务流程即可。"
+
+        # ── ② 负面 / 紧急情绪 → 先安抚 ──
+        if "高" in emotion_result:
+            print("小智：[安抚] 非常抱歉给您带来这么不好的体验，我马上优先为您处理！")
+        elif "中" in emotion_result:
+            print("小智：[安抚] 很抱歉给您添麻烦了，我来帮您解决。")
+
+        # ── ③ Agent 处理 ──
+        try:
+            response = chat(user_input, thread_id)
+
+            # ── ④ 判断是否需要转人工 ──
+            if self._need_human_agent(response):
+                return self._transfer_to_human(user_input, thread_id)
+
+            return response
+        except Exception as e:
+            # ── ⑤ 异常兜底转人工 ──
+            print(f"[系统] Agent 处理异常：{e}")
+            return self._transfer_to_human(user_input, thread_id)
+
+    def _need_human_agent(self, agent_response: str) -> bool:
+        """
+        检测 Agent 回复中是否包含转人工意图。
+
+        匹配关键词：
+        - "转人工" / "转接人工" → Agent 主动建议转接
+        - "人工客服" → 涉及需要人工处理的场景
+        - "无法处理" / "无法直接处理" → Agent 能力边界
+        """
+        keywords = ["转人工", "转接人工", "人工客服", "无法处理", "无法直接处理"]
+        return any(kw in agent_response for kw in keywords)
+
+    def _transfer_to_human(self, user_input: str, thread_id: str) -> str:
+        """
+        记录转人工请求并返回排队信息。
+
+        将用户输入、会话 ID、时间戳加入人工客服队列，
+        返回排队序号供用户参考。
+        """
+        self.human_agent_queue.append({
+            "user_input": user_input,
+            "session_id": thread_id,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        queue_num = len(self.human_agent_queue)
+        return (
+            f"我为您转接人工客服，请稍等...\n"
+            f"您当前排队序号：{queue_num}，"
+            f"人工客服将在工作时间（每天 9:00-22:00）内尽快回复您。"
+        )
+
+    def get_queue_status(self) -> str:
+        """查看当前排队情况"""
+        if not self.human_agent_queue:
+            return "当前无人排队。"
+        return f"当前排队人数：{len(self.human_agent_queue)}，预计等待约 {len(self.human_agent_queue) * 3} 分钟。"
+
+
+# ================================================================
+# 8. 命令行入口
 # ================================================================
 if __name__ == "__main__":
     if not DEEPSEEK_API_KEY:
@@ -304,29 +406,38 @@ if __name__ == "__main__":
     print()
     print("=" * 55)
     print("   电商智能客服「小智」已上线")
-    print("   支持：查订单 | FAQ 咨询 | 退换货 | 情绪安抚")
+    print("   支持：查订单 | FAQ 咨询 | 退换货 | 情绪安抚 | 转人工")
     print("   输入 quit / exit 退出")
     print("=" * 55)
+
+    # ── 创建增强版客服 Agent ──
+    enhanced_agent = EnhancedCustomerServiceAgent()
 
     # ── 自动演示 ──
     print()
     print("--- 演示 1：正常查询 ---")
     print(f"用户：帮我查一下订单 ORD001")
-    print(f"客服：{chat('帮我查一下订单 ORD001', thread_id='demo')}")
+    print(f"客服：{enhanced_agent.handle_message('帮我查一下订单 ORD001', thread_id='demo')}")
 
     print()
-    print("--- 演示 2：负面情绪 + 投诉 ---")
+    print("--- 演示 2：负面情绪 + 投诉（情绪预检 → 安抚 → 处理）---")
     print(f"用户：你们这破耳机质量太差了，我要投诉！马上退款！")
-    print(f"客服：{chat('你们这破耳机质量太差了，我要投诉！马上退款！', thread_id='demo')}")
+    print(f"客服：{enhanced_agent.handle_message('你们这破耳机质量太差了，我要投诉！马上退款！', thread_id='demo')}")
 
     print()
     print("--- 演示 3：FAQ 咨询（同一 demo 会话，验证多轮记忆）---")
     print(f"用户：退换货怎么操作？")
-    print(f"客服：{chat('退换货怎么操作？', thread_id='demo')}")
+    print(f"客服：{enhanced_agent.handle_message('退换货怎么操作？', thread_id='demo')}")
+
+    print()
+    print("--- 演示 4：转人工场景 ---")
+    print(f"用户：我要投诉你们公司，找你们经理来！")
+    print(f"客服：{enhanced_agent.handle_message('我要投诉你们公司，找你们经理来！', thread_id='demo')}")
 
     print()
     print("=" * 55)
     print("   手动对话模式（输入 quit 退出）")
+    print(f"   当前排队状态：{enhanced_agent.get_queue_status()}")
     print("=" * 55)
     print()
 
@@ -342,6 +453,6 @@ if __name__ == "__main__":
         if user_input.lower() in ("quit", "exit", "q"):
             print("感谢使用，再见！")
             break
-        resp = chat(user_input, thread_id=session_id)
+        resp = enhanced_agent.handle_message(user_input, thread_id=session_id)
         print(f"小智：{resp}")
         print()

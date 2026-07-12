@@ -26,16 +26,51 @@
 | **情绪识别与安抚** | 关键词匹配（负面词 + 紧急词），Agent 按等级执行安抚话术 |
 | **人工客服转接** | 系统提示词中定义 4 条转人工规则，Agent 自动判断 |
 | **最大迭代限制** | `recursion_limit=10`，防止 Agent 陷入死循环 |
+| **🆕 增强版客服封装** | `EnhancedCustomerServiceAgent` 类：情绪预检 → 安抚 → Agent → 转人工判断 → 排队 |
+
+## 🆕 EnhancedCustomerServiceAgent
+
+增强版客服 Agent 封装，在基础 Agent 之上增加四层防护：
+
+```
+用户消息
+  │
+  ▼
+① 情绪预检（detect_emotion）
+  ├─ 负面情绪 → 立刻安抚话术
+  └─ 正常情绪 → 直接进入下一步
+  │
+  ▼
+② 基础 Agent 处理（LangGraph + 工具调用）
+  │
+  ▼
+③ 转人工判断（_need_human_agent）
+  ├─ 匹配转人工关键词 → 走排队流程
+  └─ 正常回复 → 直接返回
+  │
+  ▼
+④ 异常兜底（try/except）
+  └─ Agent 崩溃 → 自动转人工，避免用户等待超时
+```
+
+| 方法 | 说明 |
+|------|------|
+| `handle_message(user_input, thread_id)` | 增强版消息处理入口 |
+| `_need_human_agent(agent_response)` | 检测是否需要转人工 |
+| `_transfer_to_human(user_input, thread_id)` | 加入排队队列，返回排队序号 |
+| `get_queue_status()` | 查看当前排队人数和预计等待时间 |
 
 ## 项目结构
 
 ```
 ecommerce_ai_customer/
-├── main.py             # 主程序（Agent 定义 + 工具 + 交互入口）
+├── main.py             # 主程序（Agent + 工具 + EnhancedCustomerServiceAgent + 交互入口）
 ├── requirements.txt    # Python 依赖
-├── .env                # 环境变量（需自行创建，见下方说明）
-├── order.db            # SQLite 数据库（自动生成）
-└── chroma_faq/         # ChromaDB 持久化目录（自动生成）
+├── .env                # 环境变量（需自行创建：DEEPSEEK_API_KEY=sk-xxx）
+├── .gitignore          # Git 忽略规则
+├── order.db            # SQLite 订单数据库（首次运行自动生成）
+├── chroma_faq/         # ChromaDB 向量库持久化目录（首次运行自动生成）
+└── README.md           # 项目文档
 ```
 
 ## 快速开始
@@ -63,21 +98,4 @@ python main.py
 
 程序会自动执行 3 轮演示对话，然后进入手动对话模式。
 
-## 面试准备要点
 
-如果你把这个项目写进简历，面试官大概率会问：
-
-- **"为什么用 LangGraph 而不用 LangChain 的 AgentExecutor？"**
-  → LangGraph 内置 `MemorySaver` 支持多轮对话持久化，且 `create_react_agent` 比老版 `AgentExecutor` 更可控
-
-- **"MemorySaver 的原理是什么？多用户怎么隔离？"**
-  → 基于 `thread_id` 做会话隔离，每个 thread 独立存储消息历史；生产环境可换成 `SqliteSaver` 持久化到数据库
-
-- **"情绪识别为什么用关键词而不用模型分类？"**
-  → 关键词匹配零延迟、零成本、可解释性强；模型分类需要额外标注数据和推理开销，对客服场景的关键词匹配已足够
-
-- **"FAQ 检索用的什么嵌入模型？为什么选它？"**
-  → `text2vec-base-chinese`，中文语义效果好（CoSENT 训练），免费开源，400MB 轻量可本地运行，不需要调 OpenAI API
-
-- **"recursion_limit 设了多少？为什么？"**
-  → 10 轮。客服对话通常 2-4 轮工具调用完成，10 轮是安全上限，防止 LLM 陷入"调工具→不满意→再调→还不满意"的死循环

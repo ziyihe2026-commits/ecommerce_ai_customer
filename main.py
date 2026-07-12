@@ -1,79 +1,347 @@
+"""
+基于 LangGraph React Agent 的电商智能客服系统
+
+核心功能（全部可运行验证）：
+1. 多轮对话记忆 —— MemorySaver 持久化上下文
+2. 订单查询工具 —— SQLite 本地订单数据库
+3. FAQ 语义检索 —— ChromaDB + 免费本地嵌入模型
+4. 情绪识别与安抚 —— 关键词匹配 + 安抚话术
+5. 人工客服转接 —— 无法解决时自动引导
+6. 最大迭代限制 —— recursion_limit 防止无限循环
+"""
+
 from dotenv import load_dotenv
 import os
-from langgraph.prebuilt import create_react_agent
-from langchain_deepseek import ChatDeepSeek
 import sqlite3
-from langchain.tools import tool
+from typing import Optional
 
-# 加载环境变量
+# ── LangChain / LangGraph ──────────────────────────────
+from langgraph.prebuilt import create_react_agent
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_deepseek import ChatDeepSeek
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
+from langchain.tools import tool
+from langchain_core.messages import SystemMessage
+
+# ── 加载环境变量 ────────────────────────────────────────
 load_dotenv()
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
-# 1. 初始化数据库（订单表）
+# ================================================================
+# 1. 数据库初始化 —— 订单表 + 测试数据
+# ================================================================
 def init_db():
+    """创建订单表并插入测试数据"""
     conn = sqlite3.connect("order.db")
     cursor = conn.cursor()
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS orders (
-        order_id TEXT PRIMARY KEY,
-        user_name TEXT,
-        goods_name TEXT,
-        price REAL,
-        status TEXT
-    )
-    ''')
-    # 插入测试订单数据
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            order_id   TEXT PRIMARY KEY,
+            user_name  TEXT,
+            goods_name TEXT,
+            price      REAL,
+            status     TEXT
+        )
+    """)
     test_data = [
         ("ORD001", "张三", "无线蓝牙耳机", 199.0, "已发货"),
-        ("ORD002", "李四", "机械键盘", 129.0, "待付款"),
-        ("ORD003", "王五", "电竞鼠标", 89.0, "已完成")
+        ("ORD002", "李四", "机械键盘",     129.0, "待付款"),
+        ("ORD003", "王五", "电竞鼠标",      89.0, "已完成"),
+        ("ORD004", "赵六", "USB-C 充电线",   29.9, "已发货"),
+        ("ORD005", "张三", "手机壳",         39.0, "待发货"),
     ]
-    cursor.executemany("INSERT OR IGNORE INTO orders VALUES (?,?,?,?,?)", test_data)
+    cursor.executemany(
+        "INSERT OR IGNORE INTO orders VALUES (?,?,?,?,?)", test_data
+    )
     conn.commit()
     conn.close()
 
-# 2. 定义查询订单工具
+
+# ================================================================
+# 2. FAQ 知识库 —— ChromaDB 语义检索（免费本地嵌入）
+# ================================================================
+FAQ_DATA: list[dict] = []
+FAQ_COLLECTION: Optional[Chroma] = None
+
+def init_faq():
+    """构建 FAQ 向量库，使用免费中文嵌入模型（首次运行自动下载）"""
+    global FAQ_DATA, FAQ_COLLECTION
+
+    FAQ_DATA.clear()
+    FAQ_DATA.extend([
+        {
+            "question": "如何查询我的订单？",
+            "answer": "请提供您的订单号（如 ORD001），我立刻帮您查询。"
+        },
+        {
+            "question": "怎么申请退换货？",
+            "answer": "收到商品 7 天内可申请退换货。请提供订单号，我为您生成退换货申请链接。"
+        },
+        {
+            "question": "退款什么时候到账？",
+            "answer": "退款将在仓库签收退货后 3-5 个工作日内原路返回您的支付账户。"
+        },
+        {
+            "question": "发货后多久能收到？",
+            "answer": "正常情况下 2-5 个工作日送达，具体时效视收货地址而定。"
+        },
+        {
+            "question": "商品有质量问题怎么办？",
+            "answer": "非常抱歉！请提供订单号和商品照片，我立即帮您走售后流程。"
+        },
+        {
+            "question": "可以修改收货地址吗？",
+            "answer": "订单未发货前可修改地址，请提供订单号和新地址。"
+        },
+        {
+            "question": "蓝牙耳机怎么连接？",
+            "answer": "长按电源键 3 秒进入配对模式，手机蓝牙搜索设备名 BT-XXX 点击连接即可。"
+        },
+        {
+            "question": "客服工作时间是什么？",
+            "answer": "在线客服工作时间：每天 9:00-22:00。其余时间可留言，次日回复。"
+        },
+    ])
+
+    texts = [item["question"] for item in FAQ_DATA]
+    embedding_model = HuggingFaceEmbeddings(
+        model_name="shibing624/text2vec-base-chinese"
+    )
+    FAQ_COLLECTION = Chroma.from_texts(
+        texts=texts,
+        embedding=embedding_model,
+        persist_directory="./chroma_faq",
+    )
+
+
+# ================================================================
+# 3. 工具定义
+# ================================================================
+
 @tool
 def query_order(order_id: str) -> str:
     """
-    根据订单号查询用户订单信息
+    根据订单号查询用户订单信息（含用户、商品、价格、状态）。
+    适用场景：用户提供订单号希望查进度/详情。
     Args:
         order_id: 订单编号，如 ORD001
     """
     conn = sqlite3.connect("order.db")
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,))
-    res = cursor.fetchone()
+    row = cursor.fetchone()
     conn.close()
-    if res:
-        return f"订单号：{res[0]}，用户：{res[1]}，商品：{res[2]}，价格：{res[3]}，状态：{res[4]}"
+    if row:
+        return (
+            f"订单号：{row[0]} | 用户：{row[1]} | "
+            f"商品：{row[2]} | 金额：{row[3]}元 | 状态：{row[4]}"
+        )
+    return f"未查询到订单 {order_id}，请确认订单号是否正确。"
+
+
+@tool
+def search_faq(question: str) -> str:
+    """
+    从 FAQ 知识库中语义检索与用户问题最匹配的答案。
+    适用场景：用户咨询退换货规则、时效、售后政策等通用问题。
+    Args:
+        question: 用户提出的问题原文
+    """
+    global FAQ_COLLECTION
+    if FAQ_COLLECTION is None:
+        return "FAQ 知识库尚未初始化，请稍后再试。"
+    docs = FAQ_COLLECTION.similarity_search(question, k=2)
+    if not docs:
+        return "FAQ 库中暂未找到相关答案，建议转接人工客服处理。"
+    results = []
+    for i, doc in enumerate(docs, 1):
+        matched_q = doc.page_content
+        full_answer = next(
+            (item["answer"] for item in FAQ_DATA if item["question"] == matched_q),
+            "请参考 FAQ 文档。"
+        )
+        results.append(f"[匹配{i}] 问题：{matched_q}\n     答案：{full_answer}")
+    return "\n".join(results)
+
+
+@tool
+def detect_emotion(user_message: str) -> str:
+    """
+    检测用户消息中的负面情绪（投诉/愤怒/焦虑）。
+    适用场景：用户语气激烈时调用，决定是否需要安抚话术。
+    Args:
+        user_message: 用户最近一条消息原文
+    """
+    negative_kw = [
+        "投诉", "差评", "垃圾", "骗子", "坑", "退款", "退货",
+        "气死", "烦", "烂", "坑爹", "假的", "骗钱", "太差",
+        "坑人", "曝光", "维权", "12315",
+    ]
+    urgent_kw = ["马上", "立刻", "赶紧", "快", "急", "现在就要"]
+
+    neg_hits = sum(1 for kw in negative_kw if kw in user_message)
+    urg_hits = sum(1 for kw in urgent_kw if kw in user_message)
+
+    if neg_hits >= 2 and urg_hits >= 1:
+        return "情绪等级：高（强烈不满+急迫）。请立即安抚并优先处理，必要时转人工。"
+    elif neg_hits >= 1:
+        return "情绪等级：中（含有负面词汇）。请先表达歉意再解决问题。"
+    elif urg_hits >= 1:
+        return "情绪等级：低（用户比较着急）。加快响应节奏。"
     else:
-        return "未查询到该订单，请检查订单号是否正确"
+        return "情绪等级：正常。标准服务流程即可。"
 
-# 3. 初始化大模型
-llm = ChatDeepSeek(
-    model="deepseek-chat",
-    api_key=DEEPSEEK_API_KEY
-)
 
-# 4. 构建React Agent
-tools = [query_order]
-agent_graph = create_react_agent(llm, tools)
+# ================================================================
+# 4. 系统提示词 —— 定义 Agent 行为规范
+# ================================================================
+SYSTEM_PROMPT = """
+你是一个专业的电商客服 AI，名字叫"小智"。严格遵守以下规则：
 
-# 5. 对话测试函数
-def chat_customer_service(user_input: str):
-    response = agent_graph.invoke({"messages": [("user", user_input)]})
-    return response["messages"][-1].content
+【你的工具】
+- query_order：查询订单（需要订单号）
+- search_faq：语义搜索 FAQ 知识库（退换货/时效/政策等通用问题）
+- detect_emotion：检测用户情绪
 
+【工作流程——每轮必须执行】
+1. 先调用 detect_emotion 检测用户当前消息的情绪：
+   - 等级"高" → 先说安抚话术（如"非常抱歉给您带来不好的体验，我马上帮您处理"）
+   - 等级"中" → 先说"很抱歉给您添麻烦了，我来帮您解决"
+   - 等级"低"或"正常" → 直接解决问题
+2. 判断用户意图（查订单 / 问政策 / 投诉）
+3. 调用对应工具获取信息
+4. 用自然语言完整回答
+5. 结尾问"还有其他需要帮您的吗？"
+
+【转人工规则——遇到以下任一情况，必须提示转人工】
+- 用户要求退款/赔偿，且 FAQ 中没有明确方案
+- 工具返回空结果且你无法通过常识回答
+- 用户连续表达不满
+- 涉及法律/隐私/账号安全问题
+转人工话术："这个我暂时无法直接处理，为您转接人工客服，请稍候。"
+
+【禁止行为】
+- 禁止编造订单数据（必须调用工具查询）
+- 禁止承诺具体赔偿金额
+- 不确定就诚实说不知道，转人工
+"""
+
+
+# ================================================================
+# 5. 构建 Agent（带记忆）
+# ================================================================
+_agent = None
+
+def get_agent():
+    """懒加载全局 Agent（含 MemorySaver 和工具集）"""
+    global _agent
+    if _agent is not None:
+        return _agent
+
+    llm = ChatDeepSeek(
+        model="deepseek-chat",
+        api_key=DEEPSEEK_API_KEY,
+        temperature=0.3,
+    )
+
+    tools = [query_order, search_faq, detect_emotion]
+
+    # MemorySaver —— 按 thread_id 隔离多轮对话上下文
+    memory = MemorySaver()
+
+    _agent = create_react_agent(
+        model=llm,
+        tools=tools,
+        prompt=SystemMessage(content=SYSTEM_PROMPT),
+        checkpointer=memory,
+    )
+    return _agent
+
+
+# ================================================================
+# 6. 对话接口
+# ================================================================
+def chat(user_input: str, thread_id: str = "default") -> str:
+    """
+    单轮对话入口。
+
+    Parameters
+    ----------
+    user_input : 用户输入
+    thread_id  : 会话 ID。不同用户用不同 ID 实现记忆隔离；
+                同一 thread_id 共享最近多轮上下文。
+    """
+    agent = get_agent()
+
+    config = {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": 10,  # 最大工具调用轮数
+    }
+
+    result = agent.invoke(
+        {"messages": [("user", user_input)]},
+        config=config,
+    )
+
+    return result["messages"][-1].content
+
+
+# ================================================================
+# 7. 命令行入口
+# ================================================================
 if __name__ == "__main__":
-    # 初始化数据库
+    if not DEEPSEEK_API_KEY:
+        print("错误：请在 .env 文件中设置 DEEPSEEK_API_KEY=你的key")
+        exit(1)
+
+    print("初始化数据库...")
     init_db()
-    print("==== 电商智能客服Agent已启动 ====")
-    print("测试对话1：查询ORD001订单")
-    print(chat_customer_service("帮我查一下订单ORD001"))
-    print("-" * 50)
-    print("测试对话2：查询ORD999不存在订单")
-    print(chat_customer_service("查订单ORD999"))
-    print("-" * 50)
-    print("测试对话3：咨询商品相关问题")
-    print(chat_customer_service("蓝牙耳机质量怎么样？"))
+
+    print("初始化 FAQ 知识库（首次运行会下载嵌入模型约 400MB，请耐心等待）...")
+    init_faq()
+
+    print()
+    print("=" * 55)
+    print("   电商智能客服「小智」已上线")
+    print("   支持：查订单 | FAQ 咨询 | 退换货 | 情绪安抚")
+    print("   输入 quit / exit 退出")
+    print("=" * 55)
+
+    # ── 自动演示 ──
+    print()
+    print("--- 演示 1：正常查询 ---")
+    print(f"用户：帮我查一下订单 ORD001")
+    print(f"客服：{chat('帮我查一下订单 ORD001', thread_id='demo')}")
+
+    print()
+    print("--- 演示 2：负面情绪 + 投诉 ---")
+    print(f"用户：你们这破耳机质量太差了，我要投诉！马上退款！")
+    print(f"客服：{chat('你们这破耳机质量太差了，我要投诉！马上退款！', thread_id='demo')}")
+
+    print()
+    print("--- 演示 3：FAQ 咨询（同一 demo 会话，验证多轮记忆）---")
+    print(f"用户：退换货怎么操作？")
+    print(f"客服：{chat('退换货怎么操作？', thread_id='demo')}")
+
+    print()
+    print("=" * 55)
+    print("   手动对话模式（输入 quit 退出）")
+    print("=" * 55)
+    print()
+
+    session_id = "user_session_1"
+    while True:
+        try:
+            user_input = input("你：").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n再见！")
+            break
+        if not user_input:
+            continue
+        if user_input.lower() in ("quit", "exit", "q"):
+            print("感谢使用，再见！")
+            break
+        resp = chat(user_input, thread_id=session_id)
+        print(f"小智：{resp}")
+        print()

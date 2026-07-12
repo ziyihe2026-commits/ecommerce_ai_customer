@@ -1,3 +1,7 @@
 langchain
-langchain-openai
+langgraph
+langchain-deepseek
+langchain-community
+langchain-chroma
 python-dotenv
+sentence-transformers

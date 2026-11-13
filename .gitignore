@@ -9,3 +9,5 @@ __pycache__/
 .vscode/
 .DS_Store
 chroma_faq/
+chroma_kb/
+kb_docs/

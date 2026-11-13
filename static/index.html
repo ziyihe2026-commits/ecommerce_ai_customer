@@ -15,6 +15,13 @@
   .user { margin-left: auto; background: #1f6feb; color: #fff; }
   .bot { background: #fff; color: #222; border: 1px solid #e3e5e8; }
   .tip { color: #999; font-size: 12px; text-align: center; margin: 6px 0; }
+  #kb { display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+        padding: 8px 18px; background: #eef3fb; border-bottom: 1px solid #dbe4f0; font-size: 13px; }
+  .upload { padding: 6px 12px; background: #fff; border: 1px solid #1f6feb; color: #1f6feb;
+            border-radius: 6px; cursor: pointer; }
+  #docs { display: flex; gap: 8px; flex-wrap: wrap; }
+  .doc { background: #fff; border: 1px solid #dbe4f0; border-radius: 6px; padding: 2px 8px; }
+  .doc button { background: none; color: #999; padding: 0 0 0 6px; font-size: 13px; }
   footer { display: flex; gap: 8px; padding: 12px; background: #fff; border-top: 1px solid #e3e5e8; }
   #input { flex: 1; padding: 10px 12px; border: 1px solid #ccc; border-radius: 8px; font-size: 14px; }
   button { padding: 10px 18px; border: 0; border-radius: 8px; background: #1f6feb;
@@ -24,6 +31,11 @@
 </head>
 <body>
 <header>小智 · 电商智能客服</header>
+<div id="kb">
+  <label class="upload">上传知识库文档<input id="file" type="file" accept=".txt,.md,.markdown,.pdf,.docx" hidden></label>
+  <span id="kbmsg"></span>
+  <div id="docs"></div>
+</div>
 <div id="box"><div class="tip">试试：帮我查一下订单 ORD001</div></div>
 <footer>
   <input id="input" placeholder="输入消息，回车发送" autocomplete="off">
@@ -69,6 +81,52 @@
 
   btn.onclick = send;
   input.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+
+  // ── 知识库：上传 / 列表 / 删除 ──
+  const fileInput = document.getElementById('file');
+  const kbMsg = document.getElementById('kbmsg');
+  const docsBox = document.getElementById('docs');
+
+  async function loadDocs() {
+    const res = await fetch('/api/kb/docs');
+    const docs = await res.json();
+    docsBox.innerHTML = '';
+    docs.forEach(d => {
+      const el = document.createElement('div');
+      el.className = 'doc';
+      el.textContent = `${d.source}（${d.chunks} 段）`;
+      const del = document.createElement('button');
+      del.textContent = '×';
+      del.title = '删除';
+      del.onclick = async () => {
+        await fetch('/api/kb/docs/' + d.doc_id, { method: 'DELETE' });
+        loadDocs();
+      };
+      el.appendChild(del);
+      docsBox.appendChild(el);
+    });
+  }
+
+  fileInput.addEventListener('change', async () => {
+    const f = fileInput.files[0];
+    if (!f) return;
+    kbMsg.textContent = `正在解析 ${f.name}…`;
+    const form = new FormData();
+    form.append('file', f);
+    try {
+      const res = await fetch('/api/kb/upload', { method: 'POST', body: form });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || '上传失败');
+      kbMsg.textContent = `已入库：${data.source}，${data.chunks} 段`;
+      loadDocs();
+    } catch (e) {
+      kbMsg.textContent = e.message;
+    } finally {
+      fileInput.value = '';
+    }
+  });
+
+  loadDocs();
 </script>
 </body>
 </html>

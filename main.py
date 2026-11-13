@@ -20,10 +20,12 @@ from typing import Optional
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_deepseek import ChatDeepSeek
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain.tools import tool
 from langchain_core.messages import SystemMessage
+
+from embeddings import get_embeddings
+from kb import search_kb
 
 # ── 加载环境变量 ────────────────────────────────────────
 load_dotenv()
@@ -55,6 +57,28 @@ def init_db():
     cursor.executemany(
         "INSERT OR IGNORE INTO orders VALUES (?,?,?,?,?)", test_data
     )
+
+    # 追加 100 条种子订单（ORD006–ORD105），让演示数据接近真实业务量
+    import random
+
+    random.seed(42)
+    names = ["张三", "李四", "王五", "赵六", "孙七", "周八", "吴九", "郑十"]
+    goods = [
+        "无线蓝牙耳机", "机械键盘", "电竞鼠标", "USB-C 充电线", "手机壳",
+        "显示器支架", "便携充电宝", "降噪耳塞", "桌面音箱", "Type-C 扩展坞",
+    ]
+    statuses = ["待付款", "待发货", "已发货", "已完成", "已取消"]
+    extra = [
+        (
+            f"ORD{i:03d}",
+            random.choice(names),
+            random.choice(goods),
+            round(random.uniform(19.0, 599.0), 1),
+            random.choice(statuses),
+        )
+        for i in range(6, 106)
+    ]
+    cursor.executemany("INSERT OR IGNORE INTO orders VALUES (?,?,?,?,?)", extra)
     conn.commit()
     conn.close()
 
@@ -106,13 +130,10 @@ def init_faq():
     ])
 
     texts = [item["question"] for item in FAQ_DATA]
-    embedding_model = HuggingFaceEmbeddings(
-        model_name="shibing624/text2vec-base-chinese"
-    )
     # 幂等初始化：已有集合就复用，避免每次启动重复追加（原先 2→4 的问题）
     FAQ_COLLECTION = Chroma(
         collection_name="faq",
-        embedding_function=embedding_model,
+        embedding_function=get_embeddings(),
         persist_directory="./chroma_faq",
     )
     if FAQ_COLLECTION.get(limit=1)["ids"]:
@@ -208,6 +229,7 @@ SYSTEM_PROMPT = """
 【你的工具】
 - query_order：查询订单（需要订单号）
 - search_faq：语义搜索 FAQ 知识库（退换货/时效/政策等通用问题）
+- search_kb：检索已上传的客服文档（发票、保修、活动规则、商品说明等）
 - detect_emotion：检测用户情绪
 
 【工作流程——每轮必须执行】
@@ -251,7 +273,7 @@ def get_agent():
         temperature=0.3,
     )
 
-    tools = [query_order, search_faq, detect_emotion]
+    tools = [query_order, search_faq, detect_emotion, search_kb]
 
     # MemorySaver —— 按 thread_id 隔离多轮对话上下文
     memory = MemorySaver()

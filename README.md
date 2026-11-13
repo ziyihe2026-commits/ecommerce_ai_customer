@@ -29,13 +29,16 @@
 | **最大迭代限制** | `recursion_limit=10`，防止 Agent 陷入死循环 |
 | **增强版客服封装** | `EnhancedCustomerServiceAgent` 类：情绪预检 → 安抚 → Agent → 转人工判断 → 排队 |
 | **Web 聊天界面** | FastAPI 接口 + 单页网页，浏览器直接对话 |
+| **知识库上传（RAG）** | 上传 txt/md/pdf/docx → 自动切分（500 字/重叠 50）→ 向量化入库 → Agent 通过 `search_kb` 工具检索 |
 
 ## 项目结构
 
 ```
 ecommerce_ai_customer/
 ├── main.py             # 核心：工具、Agent、EnhancedCustomerServiceAgent
-├── app.py              # FastAPI 入口（/api/chat、/api/health）
+├── kb.py               # 知识库：解析、切分、向量化、search_kb 工具
+├── embeddings.py       # 嵌入模型单例（FAQ 与知识库共用）
+├── app.py              # FastAPI 入口（/api/chat、/api/kb/*）
 ├── static/
 │   └── index.html      # 网页聊天界面
 ├── requirements.txt    # Python 依赖（已锁定版本）
@@ -81,6 +84,16 @@ uvicorn app:app --port 8000
 
 浏览器打开 <http://127.0.0.1:8000> 即可聊天。首次启动需加载嵌入模型，约 10–30 秒。
 
+### 3C. 使用知识库
+
+页面上方「上传知识库文档」支持 `.txt` / `.md` / `.pdf` / `.docx`，上传后自动切分（500 字/重叠 50）并向量化入库，Agent 会在需要时调用 `search_kb` 检索；文档列表可删除。
+
+| 接口 | 说明 |
+|------|------|
+| `POST /api/kb/upload` | multipart 上传，字段名 `file` |
+| `GET /api/kb/docs` | 列出已入库文档 |
+| `DELETE /api/kb/docs/{doc_id}` | 删除文档及其片段 |
+
 ## 已知局限与改进路线
 
 | 问题 | 现状 | 改进方向 |
@@ -88,7 +101,7 @@ uvicorn app:app --port 8000
 | 转人工判定 | 靠匹配回复中的关键词（字符串匹配） | 改为 LangGraph 条件边，由状态决定控制流 |
 | 情绪识别 | 关键词 + 阈值，无法理解反讽/上下文 | 换小模型分类或 LLM 结构化输出 |
 | 会话存储 | `MemorySaver` 存在内存，重启即丢 | 换 SQLite / Redis checkpointer |
-| 知识库 | 8 条硬编码 FAQ，无上传入口 | 增加文档上传 + 自动切分 + 幂等入库 |
+| 知识库 | 已支持文档上传 + 切分 + 幂等入库，但无权限控制 | 加鉴权、去重提示、按文档过滤检索 |
 | 工程化 | 无测试、无日志、无鉴权 | 补 pytest、结构化日志、接口鉴权 |
 | 部署 | 仅本地运行 | 容器化后部署到云平台 |
 

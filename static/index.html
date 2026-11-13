@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>小智 · 电商客服</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; height: 100vh; display: flex; flex-direction: column;
+         font-family: "Microsoft YaHei", system-ui, sans-serif; background: #f5f6f8; }
+  header { padding: 14px 18px; background: #1f6feb; color: #fff; font-size: 16px; }
+  #box { flex: 1; overflow-y: auto; padding: 18px; }
+  .msg { max-width: 70%; margin: 10px 0; padding: 10px 14px; border-radius: 10px;
+         line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+  .user { margin-left: auto; background: #1f6feb; color: #fff; }
+  .bot { background: #fff; color: #222; border: 1px solid #e3e5e8; }
+  .tip { color: #999; font-size: 12px; text-align: center; margin: 6px 0; }
+  footer { display: flex; gap: 8px; padding: 12px; background: #fff; border-top: 1px solid #e3e5e8; }
+  #input { flex: 1; padding: 10px 12px; border: 1px solid #ccc; border-radius: 8px; font-size: 14px; }
+  button { padding: 10px 18px; border: 0; border-radius: 8px; background: #1f6feb;
+           color: #fff; cursor: pointer; }
+  button:disabled { background: #9bbdf0; cursor: not-allowed; }
+</style>
+</head>
+<body>
+<header>小智 · 电商智能客服</header>
+<div id="box"><div class="tip">试试：帮我查一下订单 ORD001</div></div>
+<footer>
+  <input id="input" placeholder="输入消息，回车发送" autocomplete="off">
+  <button id="send">发送</button>
+</footer>
+<script>
+  const box = document.getElementById('box');
+  const input = document.getElementById('input');
+  const btn = document.getElementById('send');
+  const threadId = 'web-' + Math.random().toString(36).slice(2, 10);
+
+  function add(text, who) {
+    const div = document.createElement('div');
+    div.className = 'msg ' + who;
+    div.textContent = text;
+    box.appendChild(div);
+    box.scrollTop = box.scrollHeight;
+    return div;
+  }
+
+  async function send() {
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = '';
+    add(text, 'user');
+    btn.disabled = true;
+    const thinking = add('正在输入…', 'bot');
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: text, thread_id: threadId })
+      });
+      const data = await res.json();
+      thinking.textContent = data.reply;
+    } catch (e) {
+      thinking.textContent = '网络异常，请稍后重试。';
+    } finally {
+      btn.disabled = false;
+      input.focus();
+    }
+  }
+
+  btn.onclick = send;
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+</script>
+</body>
+</html>

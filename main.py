@@ -109,11 +109,15 @@ def init_faq():
     embedding_model = HuggingFaceEmbeddings(
         model_name="shibing624/text2vec-base-chinese"
     )
-    FAQ_COLLECTION = Chroma.from_texts(
-        texts=texts,
-        embedding=embedding_model,
+    # 幂等初始化：已有集合就复用，避免每次启动重复追加（原先 2→4 的问题）
+    FAQ_COLLECTION = Chroma(
+        collection_name="faq",
+        embedding_function=embedding_model,
         persist_directory="./chroma_faq",
     )
+    if FAQ_COLLECTION.get(limit=1)["ids"]:
+        return
+    FAQ_COLLECTION.add_texts(texts=texts)
 
 
 # ================================================================
@@ -174,10 +178,11 @@ def detect_emotion(user_message: str) -> str:
     Args:
         user_message: 用户最近一条消息原文
     """
+    # 注意："退款/退货"是正常业务意图，不是负面情绪词，放进来会导致
+    # 用户问"退款多久到账"被判成负面情绪并触发安抚话术。
     negative_kw = [
-        "投诉", "差评", "垃圾", "骗子", "坑", "退款", "退货",
-        "气死", "烦", "烂", "坑爹", "假的", "骗钱", "太差",
-        "坑人", "曝光", "维权", "12315",
+        "投诉", "差评", "垃圾", "骗子", "坑", "气死", "烦", "烂",
+        "坑爹", "假的", "骗钱", "太差", "坑人", "曝光", "维权", "12315",
     ]
     urgent_kw = ["马上", "立刻", "赶紧", "快", "急", "现在就要"]
 
@@ -241,7 +246,7 @@ def get_agent():
         return _agent
 
     llm = ChatDeepSeek(
-        model="deepseek-chat",
+        model="deepseek-flash",
         api_key=DEEPSEEK_API_KEY,
         temperature=0.3,
     )
@@ -304,6 +309,8 @@ class EnhancedCustomerServiceAgent:
 
     def __init__(self):
         self.human_agent_queue: list[dict] = []
+        # 已转人工的会话：同一会话只排队一次，避免追问时被反复转接
+        self.transferred_threads: set[str] = set()
 
     def handle_message(self, user_input: str, thread_id: str = "default") -> str:
         """
@@ -331,11 +338,12 @@ class EnhancedCustomerServiceAgent:
         except Exception:
             emotion_result = "情绪等级：正常。标准服务流程即可。"
 
-        # ── ② 负面 / 紧急情绪 → 先安抚 ──
+        # ── ② 负面 / 紧急情绪 → 先安抚（拼进返回值，Web 端才拿得到）──
+        soothing = ""
         if "高" in emotion_result:
-            print("小智：[安抚] 非常抱歉给您带来这么不好的体验，我马上优先为您处理！")
+            soothing = "非常抱歉给您带来这么不好的体验，我马上优先为您处理！\n"
         elif "中" in emotion_result:
-            print("小智：[安抚] 很抱歉给您添麻烦了，我来帮您解决。")
+            soothing = "很抱歉给您添麻烦了，我来帮您解决。\n"
 
         # ── ③ Agent 处理 ──
         try:
@@ -343,13 +351,16 @@ class EnhancedCustomerServiceAgent:
 
             # ── ④ 判断是否需要转人工 ──
             if self._need_human_agent(response):
-                return self._transfer_to_human(user_input, thread_id)
+                if thread_id in self.transferred_threads:
+                    # 已转过人工，不再重复排队，直接把模型回复返回
+                    return soothing + response
+                return soothing + self._transfer_to_human(user_input, thread_id)
 
-            return response
+            return soothing + response
         except Exception as e:
             # ── ⑤ 异常兜底转人工 ──
             print(f"[系统] Agent 处理异常：{e}")
-            return self._transfer_to_human(user_input, thread_id)
+            return soothing + self._transfer_to_human(user_input, thread_id)
 
     def _need_human_agent(self, agent_response: str) -> bool:
         """
@@ -370,6 +381,7 @@ class EnhancedCustomerServiceAgent:
         将用户输入、会话 ID、时间戳加入人工客服队列，
         返回排队序号供用户参考。
         """
+        self.transferred_threads.add(thread_id)
         self.human_agent_queue.append({
             "user_input": user_input,
             "session_id": thread_id,
